@@ -113,11 +113,23 @@ if bare_metal_version < Version("11.0"):
     raise RuntimeError("FlashAttention is only supported on CUDA 11 and above")
 # cc_flag.append("-gencode")
 # cc_flag.append("arch=compute_75,code=sm_75")
-cc_flag.append("-gencode")
-cc_flag.append("arch=compute_80,code=sm_80")
-if bare_metal_version >= Version("11.8"):
-    cc_flag.append("-gencode")
-    cc_flag.append("arch=compute_90,code=sm_90")
+# cc_flag.append("-gencode")
+# cc_flag.append("arch=compute_80,code=sm_80")
+# if bare_metal_version >= Version("11.8"):
+#     cc_flag.append("-gencode")
+#     cc_flag.append("arch=compute_90,code=sm_90")
+env_capabilities = os.environ.get("TORCH_CUDA_ARCH_LIST")
+if env_capabilities is not None:
+    compute_capabilities = set()
+    for cap in env_capabilities.replace(";", ",").replace(" ", ",").split(","):
+        compute_capabilities.add(int(float(cap)*10))
+if not compute_capabilities:
+    compute_capabilities = {75, 80}
+    if bare_metal_version >= Version("11.8"):
+        compute_capabilities.add(90)
+# Add target compute capabilities to NVCC flags.
+for capability in compute_capabilities:
+    cc_flag += ["-gencode", f"arch=compute_{capability},code=sm_{capability}"]
 
 subprocess.run(["git", "submodule", "update", "--init", "csrc/cutlass"])
 ext_modules.append(
