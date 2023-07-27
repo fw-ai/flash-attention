@@ -119,8 +119,8 @@ if bare_metal_version < Version("11.0"):
 #     cc_flag.append("-gencode")
 #     cc_flag.append("arch=compute_90,code=sm_90")
 env_capabilities = os.environ.get("TORCH_CUDA_ARCH_LIST")
+compute_capabilities = set()
 if env_capabilities is not None:
-    compute_capabilities = set()
     for cap in env_capabilities.replace(";", ",").replace(" ", ",").split(","):
         compute_capabilities.add(int(float(cap)*10))
 if not compute_capabilities:
