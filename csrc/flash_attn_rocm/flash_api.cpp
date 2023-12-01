@@ -351,6 +351,155 @@ std::vector<torch::Tensor> mha_varlen_fwd(
           out_padded, softmax_lse, z,        rng_state};
 }
 
+namespace ort_ {
+#pragma pack(8)
+struct Tensor {
+  int dtype_;
+  const void* data_;
+  std::vector<int64_t> shape_;
+};
+}  // namespace at
+
+extern "C" void mha_varlen_fwd_c(
+    hipStream_t stream,
+    const ort_::Tensor &ort_q, // total_q x num_heads_q x head_size, total_q := \sum_{i=0}^{b} s_i
+    const ort_::Tensor &ort_k, // total_kv x num_heads_kv x head_size, total_kv :=
+                            // \sum_{i=0}^{b} s_i
+    const ort_::Tensor &ort_v, // total_kv x num_heads_kv x head_size, total_kv :=
+                            // \sum_{i=0}^{b} s_i
+    const ort_::Tensor &ort_softmax_lse, //  b x num_heads x max_seqlen
+    ort_::Tensor &ort_out_, // total_q x num_heads_q x head_size,
+                                        // total_kv := \sum_{i=0}^{b} s_i
+    const ort_::Tensor &ort_cu_seqlens_q,  // b+1
+    const ort_::Tensor &ort_cu_seqlens_kv, // b+1
+    const int max_seqlen_q, const int max_seqlen_kv,
+    const float softmax_scale, const bool is_causal) {
+  auto options = torch::TensorOptions().device(torch::kCUDA);
+  // trans ort tensor into torch tensor
+  auto q = torch::from_blob(const_cast<void*>(ort_q.data_), ort_q.shape_,
+                            options.dtype(torch::kFloat16));
+  auto k = torch::from_blob(const_cast<void*>(ort_k.data_), ort_k.shape_,
+                            options.dtype(torch::kFloat16));
+  auto v = torch::from_blob(const_cast<void*>(ort_v.data_), ort_v.shape_,
+                            options.dtype(torch::kFloat16));
+  auto softmax_lse = torch::from_blob(const_cast<void*>(ort_softmax_lse.data_), ort_softmax_lse.shape_,
+                            options.dtype(torch::kFloat32));
+  auto out_ = torch::from_blob(const_cast<void*>(ort_out_.data_), ort_out_.shape_,
+                            options.dtype(torch::kFloat16));
+  auto cu_seqlens_q = torch::from_blob(const_cast<void*>(ort_cu_seqlens_q.data_), ort_cu_seqlens_q.shape_,
+                            options.dtype(torch::kInt32));
+  auto cu_seqlens_kv = torch::from_blob(const_cast<void*>(ort_cu_seqlens_kv.data_), ort_cu_seqlens_kv.shape_,
+                            options.dtype(torch::kInt32));
+  auto dprops = at::cuda::getCurrentDeviceProperties();
+  bool is_gfx90x = dprops->major == 9 && dprops->minor == 0;
+  bool is_gfx94x = dprops->major == 9 && dprops->minor == 4;
+  TORCH_CHECK(is_gfx90x || is_gfx94x,
+              "FlashAttention only supports AMD MI200 GPUs or newer.");
+
+  auto q_dtype = q.dtype();
+  TORCH_CHECK(q_dtype == torch::kFloat16 || q_dtype == torch::kBFloat16,
+              "FlashAttention only support fp16 and bf16 data type");
+  if (q_dtype == torch::kBFloat16) {
+    TORCH_CHECK(is_gfx90x || is_gfx94x,
+                "bfloat16 is only supported on AMD MI200 GPUs or newer");
+  }
+  TORCH_CHECK(k.dtype() == q_dtype, "query and key must have the same dtype");
+  TORCH_CHECK(v.dtype() == q_dtype, "query and value must have the same dtype");
+  TORCH_CHECK(cu_seqlens_q.dtype() == torch::kInt32,
+              "cu_seqlens_q must have dtype int32");
+  TORCH_CHECK(cu_seqlens_kv.dtype() == torch::kInt32,
+              "cu_seqlens_kv must have dtype int32");
+
+  TORCH_CHECK(q.is_cuda(), "Input tensor must be on ROCm device");
+  TORCH_CHECK(k.is_cuda(), "Input tensor must be on ROCm device");
+  TORCH_CHECK(v.is_cuda(), "Input tensor must be on ROCm device");
+  TORCH_CHECK(cu_seqlens_q.is_cuda(), "cu_seqlens_q must be on ROCm device");
+  TORCH_CHECK(cu_seqlens_kv.is_cuda(), "cu_seqlens_kv must be on ROCm device");
+
+  TORCH_CHECK(q.stride(-1) == 1,
+              "Input tensor must have contiguous last dimension");
+  TORCH_CHECK(k.stride(-1) == 1,
+              "Input tensor must have contiguous last dimension");
+  TORCH_CHECK(v.stride(-1) == 1,
+              "Input tensor must have contiguous last dimension");
+  TORCH_CHECK(cu_seqlens_q.is_contiguous(), "cu_seqlens_q must be contiguous");
+  TORCH_CHECK(cu_seqlens_kv.is_contiguous(),
+              "cu_seqlens_kv must be contiguous");
+
+  const auto sizes = q.sizes();
+
+  const int total_q = sizes[0];
+  const int batch_size = cu_seqlens_q.numel() - 1;
+  const int num_heads_q = sizes[1];
+  const int head_size_og = sizes[2];
+  const int total_kv = k.size(0);
+  const int num_heads_kv = k.size(1);
+  TORCH_CHECK(batch_size > 0, "batch size must be positive");
+  TORCH_CHECK(
+      head_size_og <= 128,
+      "FlashAttention forward only supports head dimension at most 128");
+  TORCH_CHECK(
+      num_heads_q % num_heads_kv == 0,
+      "Number of heads in key/value must divide number of heads in query");
+
+  auto round_multiple = [](int x, int m) { return (x + m - 1) / m * m; };
+  const int head_size = round_multiple(head_size_og, 8);
+  TORCH_CHECK(head_size == round_multiple(head_size_og, 8),
+              "head_size must be head_size_og rounded to a multiple of 8");
+
+  CHECK_SHAPE(q, total_q, num_heads_q, head_size_og);
+  CHECK_SHAPE(k, total_kv, num_heads_kv, head_size_og);
+  CHECK_SHAPE(v, total_kv, num_heads_kv, head_size_og);
+  CHECK_SHAPE(cu_seqlens_q, batch_size + 1);
+  CHECK_SHAPE(cu_seqlens_kv, batch_size + 1);
+
+  torch::Tensor q_padded, k_padded, v_padded;
+  if (head_size_og % 8 != 0) {
+    q_padded = torch::nn::functional::pad(
+        q, torch::nn::functional::PadFuncOptions({0, 8 - head_size_og % 8}));
+    k_padded = torch::nn::functional::pad(
+        k, torch::nn::functional::PadFuncOptions({0, 8 - head_size_og % 8}));
+    v_padded = torch::nn::functional::pad(
+        v, torch::nn::functional::PadFuncOptions({0, 8 - head_size_og % 8}));
+  } else {
+    q_padded = q;
+    k_padded = k;
+    v_padded = v;
+  }
+
+  torch::Tensor out = out_;
+  TORCH_CHECK(out.dtype() == q_dtype,
+              "Output must have the same dtype as inputs");
+  TORCH_CHECK(out.is_cuda(), "Output tensor must be on ROCm device");
+  TORCH_CHECK(out.stride(-1) == 1,
+              "Output tensor must have contiguous last dimension");
+  CHECK_SHAPE(out, total_q, num_heads_q, head_size_og);
+  if (head_size_og % 8 != 0) {
+    out = torch::empty_like(q_padded);
+  }
+
+  // Otherwise the kernel will be launched from cuda:0 device
+  // Cast to char to avoid compiler warning about narrowing
+  at::cuda::HIPGuard device_guard{(char)q.get_device()};
+
+  std::vector<torch::Tensor> z_vec;
+
+  FlashFwdGroupedParams params(
+      batch_size, max_seqlen_q, max_seqlen_kv, num_heads_q, num_heads_kv,
+      head_size, q_padded, k_padded, v_padded, out, cu_seqlens_q.data_ptr(),
+      cu_seqlens_kv.data_ptr(), z_vec, softmax_lse, 0.0f, softmax_scale,
+      is_causal, false);
+
+  FlashRunner flash_runner;
+  flash_runner.Run(params, stream);
+
+  if (head_size_og % 8 != 0) {
+    out = out.index(
+        {"...", torch::indexing::Slice(torch::indexing::None, head_size_og)});
+    out_.copy_(out);
+  }
+}
+
 std::vector<torch::Tensor> mha_bwd(
     const torch::Tensor
         &dout, // batch_size x seqlen_q x num_heads_q, x head_size_og
