@@ -27,6 +27,8 @@ void run_mha_fwd_<{DTYPE}, {HEAD_DIM}>(Flash_fwd_params &params, cudaStream_t st
 KERNEL_IMPL_TEMPLATE_FWD_SPLIT = """#include "flash_fwd_launch_template.h"
 
 template void run_mha_fwd_splitkv_dispatch<{DTYPE}, {HEAD_DIM}>(Flash_fwd_params &params, cudaStream_t stream);
+
+template void run_mha_combine_k_splits<{DTYPE}, {HEAD_DIM}>(Flash_fwd_params &params, cudaStream_t stream);
 """
 
 KERNEL_IMPL_TEMPLATE_BWD = """#include "flash_bwd_launch_template.h"

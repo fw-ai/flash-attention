@@ -54,6 +54,7 @@ def _flash_attn_forward(
         v,
         None,
         alibi_slopes,
+        None,
         dropout_p,
         softmax_scale,
         causal,
