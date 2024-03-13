@@ -319,6 +319,7 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x head_size
         const at::Tensor &v,         // batch_size x seqlen_k x num_heads_k x head_size
         c10::optional<at::Tensor> &out_,             // batch_size x seqlen_q x num_heads x head_size
         c10::optional<at::Tensor> &alibi_slopes_, // num_heads or batch_size x num_heads
+        c10::optional<at::Tensor> &softmax_lse_, // batch_size x num_heads x seqlen_q
         const float p_dropout,
         const float softmax_scale,
         bool is_causal,
@@ -418,7 +419,14 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x head_size
 
     auto opts = q.options();
 
-    auto softmax_lse = torch::empty({batch_size, num_heads, seqlen_q}, opts.dtype(at::kFloat));
+    if (softmax_lse_.has_value()) {
+        TORCH_CHECK_EQ(softmax_lse_->dtype(), at::kFloat);
+        CHECK_DEVICE(softmax_lse_.value());
+        CHECK_CONTIGUOUS(softmax_lse_.value());
+        CHECK_SHAPE(softmax_lse_.value(), batch_size, num_heads, seqlen_q);
+    } else {
+        softmax_lse_ = torch::empty({batch_size, num_heads, seqlen_q}, opts.dtype(at::kFloat));
+    }
     at::Tensor p;
     // Only return softmax if there's dropout to reduce compilation time
     if (return_softmax) {
@@ -438,7 +446,7 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x head_size
                      /*cu_seqlens_k_d=*/nullptr,
                      /*seqused_k=*/nullptr,
                      return_softmax ? p.data_ptr() : nullptr,
-                     softmax_lse.data_ptr(),
+                     softmax_lse_->data_ptr(),
                      p_dropout,
                      softmax_scale,
                      window_size_left,
@@ -474,7 +482,7 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x head_size
     } else {
         // If seqlen_k == 0, then we have an empty tensor. We need to set the output to 0.
         out.zero_();
-        softmax_lse.fill_(std::numeric_limits<float>::infinity());
+        softmax_lse_->fill_(std::numeric_limits<float>::infinity());
     }
 
     at::Tensor out_padded = out;
@@ -487,9 +495,9 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x head_size
         out = out.transpose(1, 2).reshape({batch_size, 1, num_heads_k * seqlen_q, head_size_og});
         out_padded = out_padded.transpose(1, 2).reshape({batch_size, 1, num_heads_k * seqlen_q, head_size_og});
         q_padded = q_padded.transpose(1, 2).reshape({batch_size, 1, num_heads_k * seqlen_q, head_size_og});
-        softmax_lse = softmax_lse.reshape({batch_size, num_heads_k * seqlen_q, 1});
-    }
-    return {out, q_padded, k_padded, v_padded, out_padded, softmax_lse, p, rng_state};
+        softmax_lse_ = softmax_lse_->reshape({batch_size, num_heads_k * seqlen_q, 1});
+    } 
+    return {out, q_padded, k_padded, v_padded, out_padded, softmax_lse_.value(), p, rng_state};
 }
 
 std::vector<at::Tensor>
@@ -1459,6 +1467,82 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
     return {out, softmax_lse};
 }
 
+std::vector<at::Tensor>
+mha_combine_k_splits( c10::optional<at::Tensor> &out_,  // batch_size x seqlen_q x num_heads x head_size
+                c10::optional<at::Tensor> &softmax_lse_, // batch_size x num_heads x seqlen_q
+               const at::Tensor &accum,  // num_splits x batch_size x num_heads x seqlen_q x head_size
+               const at::Tensor &softmax_lse_accum  // num_splits x batch_size x num_heads x seqlen_q
+               ) {
+    const auto sizes = accum.sizes();
+    const int num_splits = sizes[0];
+    const int batch_size = sizes[1];    
+    const int num_heads = sizes[2];
+    const int seqlen_q = sizes[3];
+    const int head_size_og = sizes[4];
+
+    at::cuda::CUDAGuard device_guard{(char)accum.get_device()};
+    auto opts = accum.options();
+
+    if (out_.has_value()) {
+        auto out_dtype = out_->dtype();
+        TORCH_CHECK(out_dtype == torch::kFloat16 || out_dtype == torch::kBFloat16,
+                    "FlashAttention only support fp16 and bf16 data type");
+        CHECK_DEVICE(out_.value());
+        TORCH_CHECK_EQ(out_->stride(-1), 1);
+        CHECK_SHAPE(out_.value(), batch_size, seqlen_q, num_heads, head_size_og);
+    } else {
+        out_ = torch::empty({batch_size, seqlen_q, num_heads, head_size_og},  opts.dtype(at::kHalf));
+    }
+
+    if (softmax_lse_.has_value()) {
+        TORCH_CHECK_EQ(softmax_lse_->dtype(), torch::kFloat);
+        CHECK_DEVICE(softmax_lse_.value());
+        CHECK_CONTIGUOUS(softmax_lse_.value());
+        CHECK_SHAPE(softmax_lse_.value(), batch_size, num_heads, seqlen_q);
+    } else{
+        softmax_lse_ = torch::empty({batch_size, num_heads, seqlen_q}, opts.dtype(at::kFloat));
+    }
+
+    TORCH_CHECK_EQ(accum.dtype(), torch::kFloat);
+    CHECK_DEVICE(accum);
+    CHECK_CONTIGUOUS(accum);
+
+    TORCH_CHECK_EQ(softmax_lse_accum.dtype(), torch::kFloat);
+    CHECK_DEVICE(softmax_lse_accum);
+    CHECK_CONTIGUOUS(softmax_lse_accum);
+    CHECK_SHAPE(softmax_lse_accum, num_splits, batch_size, num_heads, seqlen_q);
+
+    auto round_multiple = [](int x, int m) { return (x + m - 1) / m * m; };
+    const int head_size = round_multiple(head_size_og, 8);
+    const int head_size_rounded = round_multiple(head_size, 32);
+
+    Flash_fwd_params params;
+    memset(&params, 0, sizeof(params));
+    params.is_bf16 = out_->dtype() == torch::kBFloat16;    
+    params.oaccum_ptr = accum.data_ptr();
+    params.softmax_lseaccum_ptr = softmax_lse_accum.data_ptr();
+    params.softmax_lse_ptr = softmax_lse_->data_ptr();
+    params.b = batch_size;
+    params.h = num_heads;
+    params.d = head_size;
+    params.d_rounded = head_size_rounded;
+    params.num_splits = num_splits;
+    params.seqlen_q = seqlen_q;
+    params.o_ptr = out_->data_ptr();
+    params.o_batch_stride = out_->stride(0);
+    params.o_row_stride = out_->stride(-3);
+    params.o_head_stride = out_->stride(-2);
+
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
+    FP16_SWITCH(!params.is_bf16, [&] {
+        HEADDIM_SWITCH(params.d, [&] {
+            run_mha_combine_k_splits<elem_type, kHeadDim>(params, stream);
+        });
+    });
+
+    return {out_.value(), softmax_lse_.value()};
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.doc() = "FlashAttention";
     m.def("fwd", &mha_fwd, "Forward pass");
@@ -1466,4 +1550,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("bwd", &mha_bwd, "Backward pass");
     m.def("varlen_bwd", &mha_varlen_bwd, "Backward pass (variable length)");
     m.def("fwd_kvcache", &mha_fwd_kvcache, "Forward pass, with KV-cache");
+    m.def("combine_k_splits", &mha_combine_k_splits, "Combine k splits");
 }
