@@ -32,11 +32,9 @@ with open("README.md", "r", encoding="utf-8") as fh:
 # ninja build does not work unless include_dirs are abs path
 this_dir = os.path.dirname(os.path.abspath(__file__))
 
-PACKAGE_NAME = "flash_attn"
+PACKAGE_NAME = "fw_flash_attn"
 
-BASE_WHEEL_URL = (
-    "https://github.com/Dao-AILab/flash-attention/releases/download/{tag_name}/{wheel_name}"
-)
+BASE_WHEEL_URL = "https://github.com/Dao-AILab/flash-attention/releases/download/{tag_name}/{wheel_name}"
 
 # FORCE_BUILD: Force a fresh build locally, instead of attempting to find prebuilt wheels
 # SKIP_CUDA_BUILD: Intended to allow CI to use a simple `python setup.py sdist` run to copy over raw files, without any cuda compilation
@@ -62,7 +60,9 @@ def get_platform():
 
 
 def get_cuda_bare_metal_version(cuda_dir):
-    raw_output = subprocess.check_output([cuda_dir + "/bin/nvcc", "-V"], universal_newlines=True)
+    raw_output = subprocess.check_output(
+        [cuda_dir + "/bin/nvcc", "-V"], universal_newlines=True
+    )
     output = raw_output.split()
     release_idx = output.index("release") + 1
     bare_metal_version = parse(output[release_idx].split(",")[0])
@@ -102,7 +102,9 @@ if not SKIP_CUDA_BUILD:
     # See https://github.com/pytorch/pytorch/pull/70650
     generator_flag = []
     torch_dir = torch.__path__[0]
-    if os.path.exists(os.path.join(torch_dir, "include", "ATen", "CUDAGeneratorImpl.h")):
+    if os.path.exists(
+        os.path.join(torch_dir, "include", "ATen", "CUDAGeneratorImpl.h")
+    ):
         generator_flag = ["-DOLD_GENERATOR_PATH"]
 
     check_if_cuda_home_none("flash_attn")
@@ -131,7 +133,7 @@ if not SKIP_CUDA_BUILD:
         torch._C._GLIBCXX_USE_CXX11_ABI = True
     ext_modules.append(
         CUDAExtension(
-            name="flash_attn_2_cuda",
+            name="fw_flash_attn_2_cuda",
             sources=[
                 "csrc/flash_attn/flash_api.cpp",
                 "csrc/flash_attn/src/flash_fwd_hdim32_fp16_sm80.cu",
@@ -232,7 +234,9 @@ def get_wheel_url():
     torch_version_raw = parse(torch.__version__)
     # For CUDA 11, we only compile for CUDA 11.8, and for CUDA 12 we only compile for CUDA 12.2
     # to save CI time. Minor versions should be compatible.
-    torch_cuda_version = parse("11.8") if torch_cuda_version.major == 11 else parse("12.2")
+    torch_cuda_version = (
+        parse("11.8") if torch_cuda_version.major == 11 else parse("12.2")
+    )
     python_version = f"cp{sys.version_info.major}{sys.version_info.minor}"
     platform_name = get_platform()
     flash_version = get_package_version()
@@ -243,7 +247,9 @@ def get_wheel_url():
 
     # Determine wheel URL based on CUDA version, torch version, python version and OS
     wheel_filename = f"{PACKAGE_NAME}-{flash_version}+cu{cuda_version}torch{torch_version}cxx11abi{cxx11_abi}-{python_version}-{python_version}-{platform_name}.whl"
-    wheel_url = BASE_WHEEL_URL.format(tag_name=f"v{flash_version}", wheel_name=wheel_filename)
+    wheel_url = BASE_WHEEL_URL.format(
+        tag_name=f"v{flash_version}", wheel_name=wheel_filename
+    )
     return wheel_url, wheel_filename
 
 
@@ -292,8 +298,12 @@ class NinjaBuildExtension(BuildExtension):
             max_num_jobs_cores = max(1, os.cpu_count() // 2)
 
             # calculate the maximum allowed NUM_JOBS based on free memory
-            free_memory_gb = psutil.virtual_memory().available / (1024 ** 3)  # free memory in GB
-            max_num_jobs_memory = int(free_memory_gb / 9)  # each JOB peak memory cost is ~8-9GB when threads = 4
+            free_memory_gb = psutil.virtual_memory().available / (
+                1024**3
+            )  # free memory in GB
+            max_num_jobs_memory = int(
+                free_memory_gb / 9
+            )  # each JOB peak memory cost is ~8-9GB when threads = 4
 
             # pick lower value of jobs based on cores vs memory metric to minimize oom and swap usage during compilation
             max_jobs = max(1, min(max_num_jobs_cores, max_num_jobs_memory))
@@ -305,18 +315,18 @@ class NinjaBuildExtension(BuildExtension):
 setup(
     name=PACKAGE_NAME,
     version=get_package_version(),
-    packages=find_packages(
-        exclude=(
-            "build",
-            "csrc",
-            "include",
-            "tests",
-            "dist",
-            "docs",
-            "benchmarks",
-            "flash_attn.egg-info",
-        )
-    ),
+    # packages=find_packages(
+    #     exclude=(
+    #         "build",
+    #         "csrc",
+    #         "include",
+    #         "tests",
+    #         "dist",
+    #         "docs",
+    #         "benchmarks",
+    #         "flash_attn.egg-info",
+    #     )
+    # ),
     author="Tri Dao",
     author_email="trid@cs.stanford.edu",
     description="Flash Attention: Fast and Memory-Efficient Exact Attention",
@@ -329,11 +339,13 @@ setup(
         "Operating System :: Unix",
     ],
     ext_modules=ext_modules,
-    cmdclass={"bdist_wheel": CachedWheelsCommand, "build_ext": NinjaBuildExtension}
-    if ext_modules
-    else {
-        "bdist_wheel": CachedWheelsCommand,
-    },
+    cmdclass=(
+        {"bdist_wheel": CachedWheelsCommand, "build_ext": NinjaBuildExtension}
+        if ext_modules
+        else {
+            "bdist_wheel": CachedWheelsCommand,
+        }
+    ),
     python_requires=">=3.7",
     install_requires=[
         "torch",
@@ -341,7 +353,5 @@ setup(
         "packaging",
         "ninja",
     ],
-    setup_requires=[
-        "psutil"
-    ],
+    setup_requires=["psutil"],
 )
