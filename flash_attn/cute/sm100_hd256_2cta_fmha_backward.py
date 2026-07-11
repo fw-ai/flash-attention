@@ -123,6 +123,7 @@ class BlackwellFusedMultiHeadAttentionBackward:
         window_size_left: int | None = None,
         window_size_right: int | None = None,
         use_clc_scheduler: bool = False,
+        prune_redundant_causal_masking: bool = False,
     ):
         """Initialization."""
         head_dim_v = head_dim if head_dim_v is None else head_dim_v
@@ -181,6 +182,7 @@ class BlackwellFusedMultiHeadAttentionBackward:
             self.window_size_left,
             self.window_size_right,
             use_clc_scheduler=self.use_clc_scheduler,
+            prune_redundant_causal_masking=prune_redundant_causal_masking,
         )
 
     @cute.jit

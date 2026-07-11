@@ -59,6 +59,9 @@ POLY_EX2 = {
 
 _fa_clc_enabled: bool = os.environ.get("FA_CLC", "0") == "1"
 _fa_disable_2cta_enabled: bool = os.environ.get("FA_DISABLE_2CTA", "0") == "1"
+_fa_hd256_prune_redundant_causal_masking: bool = (
+    os.environ.get("FA_HD256_PRUNE_REDUNDANT_CAUSAL_MASKING", "0") == "1"
+)
 
 
 def _is_cuda_12() -> bool:
