@@ -1355,6 +1355,36 @@ def _flash_attn_bwd(
         total_k = k.shape[0]
         seqlen_k = max_seqlen_k if max_seqlen_k is not None else total_k
 
+    # This opt-in is intentionally limited to the dense, equal-length causal
+    # self-attention shape validated by the hd256 2CTA kernel tests.  In
+    # particular, unequal Q/K and varlen causal boundaries need different
+    # boundary-tile accounting and must retain the baseline path.
+    hd256_prune_redundant_causal_masking = bool(
+        getattr(utils, "_fa_hd256_prune_redundant_causal_masking", False)
+        and use_dedicated_hd256_kernel
+        and causal
+        and not local
+        and window_size_left is None
+        and window_size_right is None
+        and cu_seqlens_q is None
+        and cu_seqlens_k is None
+        and seqused_q is None
+        and seqused_k is None
+        and block_sparse_tensors is None
+        and score_mod is None
+        and score_mod_bwd is None
+        and mask_mod is None
+        and aux_tensors is None
+        and dlse is None
+        and softcap == 0.0
+        and not deterministic
+        and not pack_gqa
+        and q.ndim == 4
+        and k.ndim == 4
+        and q.shape[0] == k.shape[0]
+        and seqlen_q == seqlen_k
+    )
+
     num_head_kv = k.shape[-2]
 
     use_block_sparsity = block_sparse_tensors is not None
@@ -1658,6 +1688,7 @@ def _flash_attn_bwd(
             pack_gqa,
             cluster_size,
             use_2cta_instrs,
+            hd256_prune_redundant_causal_masking,
             deterministic,
             spt,
             score_mod_hash,
@@ -1773,6 +1804,7 @@ def _flash_attn_bwd(
                     deterministic=deterministic,
                     cluster_size=cluster_size,
                     use_2cta_instrs=use_2cta_instrs,
+                    prune_redundant_causal_masking=hd256_prune_redundant_causal_masking,
                     score_mod=score_mod,
                     score_mod_bwd=score_mod_bwd,
                     mask_mod=mask_mod,

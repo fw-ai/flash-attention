@@ -101,11 +101,13 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         window_size_left: int | None,
         window_size_right: int | None,
         use_clc_scheduler: bool = False,
+        prune_redundant_causal_masking: bool = False,
     ):
         """Initialization."""
         self.acc_dtype = acc_dtype
         self.cta_tiler = cta_tiler
         self.use_clc_scheduler = use_clc_scheduler
+        self.prune_redundant_causal_masking = prune_redundant_causal_masking
         self.sched_warp_id = 10 if use_clc_scheduler else None
         # TODO: need check, not sure whether need to *2 if 2cta
         self.tile_shape_Q = cta_tiler[0]
@@ -2577,12 +2579,15 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             trailing_residual_masking = iter_index == last_iter or is_residual_k
             trailing_residual_masking = cute.arch.shuffle_sync(trailing_residual_masking, 0)
 
-            # For causal, every tile may contain (q,k) with k > q; we must apply per-element mask for all Q tiles.
+            # Once a Q tile is strictly beyond the causal boundary for this K
+            # tile, every (q, k) pair is valid.  The opt-in path limits the
+            # elementwise mask to boundary and residual tiles; the default
+            # retains the original mask on every causal tile.
             is_masked_tile = (
                 leading_causal_masking
                 or trailing_residual_masking
                 or self.has_sliding_window
-                or cutlass.const_expr(self.is_causal)
+                or cutlass.const_expr(self.is_causal and not self.prune_redundant_causal_masking)
             )
 
             # Compute P = softmax(S, LSE)
@@ -2690,14 +2695,15 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
                 )
             # For causal, force dS to zero at masked (q,k) so dK/dV accumulation is correct
             if cutlass.const_expr(self.is_causal):
-                for i in cutlass.range(cute.size(tTR_rdPT), unroll_full=True):
-                    c_transpose = tTR_cdPT[i]
-                    pos = (
-                        cute.get(c_transpose, mode=[1]) + iter_index * self.tile_shape_Q,
-                        cute.get(c_transpose, mode=[0]) + blk_coord_k * self.tile_shape_K,
-                    )
-                    if pos[0] + K - Q < pos[1] or not cute.elem_less(pos, (Q, K)):
-                        tTR_rdPT[i] = cutlass.Float32(0.0)
+                if is_masked_tile:
+                    for i in cutlass.range(cute.size(tTR_rdPT), unroll_full=True):
+                        c_transpose = tTR_cdPT[i]
+                        pos = (
+                            cute.get(c_transpose, mode=[1]) + iter_index * self.tile_shape_Q,
+                            cute.get(c_transpose, mode=[0]) + blk_coord_k * self.tile_shape_K,
+                        )
+                        if pos[0] + K - Q < pos[1] or not cute.elem_less(pos, (Q, K)):
+                            tTR_rdPT[i] = cutlass.Float32(0.0)
             # convert fp32 dS to fp16 dS which will be used in the computation of dK and DQ
             tTR_rdST = self.quantize(tTR_rdPT, dV.element_type)
 
