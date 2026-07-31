@@ -578,6 +578,12 @@ def _flash_attn_fwd(
     # hd=256 2CTA forward uses dedicated kernel (Blackwell family)
     use_dedicated_hd256_kernel = arch // 10 in [10, 11] and head_dim == 256 and head_dim_v == 256
     use_2cta_instrs = use_2cta_instrs or use_dedicated_hd256_kernel
+    if use_dedicated_hd256_kernel and local:
+        assert (
+            window_size_left is not None and window_size_left >= 0 and window_size_right == 0
+        ), (
+            "SM100/SM110 dedicated head_dim=256 forward only supports causal-left local attention"
+        )
 
     if softcap is not None:
         assert score_mod is None, "softcap and score_mod cannot be used together"
@@ -1334,6 +1340,12 @@ def _flash_attn_bwd(
 
     use_dedicated_hd256_kernel = arch // 10 in [10, 11] and head_dim == 256 and head_dim_v == 256
     use_2cta_instrs = use_2cta_instrs or use_dedicated_hd256_kernel
+    if use_dedicated_hd256_kernel and local:
+        assert (
+            window_size_left is not None and window_size_left >= 0 and window_size_right == 0
+        ), (
+            "SM100/SM110 dedicated head_dim=256 backward only supports causal-left local attention"
+        )
 
     q, k, v, out, dout, lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k = [
         maybe_contiguous(t)
@@ -1650,8 +1662,8 @@ def _flash_attn_bwd(
             head_dim_v,
             qhead_per_kvhead,
             causal,
-            window_size_left is not None,
-            window_size_right is not None,
+            window_size_left if use_dedicated_hd256_kernel else window_size_left is not None,
+            window_size_right if use_dedicated_hd256_kernel else window_size_right is not None,
             m_block_size,
             n_block_size,
             num_threads,
@@ -1782,6 +1794,8 @@ def _flash_attn_bwd(
                     tile_n_dq=dq_tile_mn[1],
                     tile_m_dkdv=dkdv_tile_mn[0],
                     tile_n_dkdv=dkdv_tile_mn[1],
+                    window_size_left=window_size_left,
+                    window_size_right=window_size_right,
                 )
             else:
                 fa_bwd_obj = FlashAttentionBackwardSm100(
@@ -1826,8 +1840,8 @@ def _flash_attn_bwd(
             cu_seqlens_k_tensor,
             seqused_q_tensor,
             seqused_k_tensor,
-            window_size_left,
-            window_size_right,
+            None if use_dedicated_hd256_kernel else window_size_left,
+            None if use_dedicated_hd256_kernel else window_size_right,
             dQ_semaphore_tensor,
             dK_semaphore_tensor,
             dV_semaphore_tensor,
@@ -1853,8 +1867,8 @@ def _flash_attn_bwd(
             cu_seqlens_k,
             seqused_q,
             seqused_k,
-            window_size_left,
-            window_size_right,
+            None if use_dedicated_hd256_kernel else window_size_left,
+            None if use_dedicated_hd256_kernel else window_size_right,
             dQ_semaphore,
             dK_semaphore,
             dV_semaphore,
